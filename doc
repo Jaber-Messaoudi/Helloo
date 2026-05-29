@@ -1,0 +1,115 @@
+ÉTUDE DE FAISABILITÉ TECHNIQUE
+Mutualisation des VM des environnements QUALIF & RECETTE
+Bascule du SVA en SecNumCloud — Outscale région cloud-gouv-eu
+
+
+
+1. Synthèse exécutive
+Cette étude évalue la faisabilité de réduire l'infrastructure des environnements de qualification (QUALIF) et de recette (RECETTE) du SVA — 11 VM applicatives (13 VM en comptant les VM RP et Bastion) pour 3 projets Drupal — a une seule VM, dans le cadre de la bascule en SecNumCloud sur Outscale (region cloud-gouv-eu).
+Conclusion : la cible « 1 VM unique » n'est pas réaliste ni recommandée pour les deux environnements réunis, en raison de contraintes de securite (cloisonnement SecNumCloud, rôle du bastion et de la VM RP), de séparation des environnements, de capacite (RAM/CPU pour Solr/Redis/Varnish + Drupal), et de robustesse opérationnelle.
+Reduction maximale recommandee : de 13 VM a 5 VM (soit -62 %), en mutualisant les 3 applicatifs par environnement, en conteneurisant Redis/Solr/Varnish, et en conservant les VM RP (Caddy + Postfix) et Bastion existantes.
+Recommandation : le scenario a 5 VM est sain et recommande pour QUALIF/RECETTE, sous réserve de 3 prérequis de mise en œuvre (limites de ressources par conteneur, supervision par conteneur, infrastructure 100 % en IaC). Il déplace la complexité de l'infrastructure vers la configuration : ce compromis est défendable hors production.
+
+2. Inventaire des VM
+Rôle / Service	Nb VM	Réseau	Stack technique
+Applicatif QUALIF	3	Prive	Apache2, PHP 8.3, Drupal (1 VM / projet)
+BDD QUALIF	1	Prive	MariaDB
+Redis + Solr QUALIF	1	Prive	Redis, Solr
+Applicatif RECETTE	3	Prive	Apache2, PHP 8.3, Drupal (1 VM / projet)
+BDD RECETTE	1	Prive	MariaDB
+Redis + Solr RECETTE	1	Prive	Redis, Solr
+Varnish (commun)	1	Prive	Varnish (cache HTTP)
+Sous-total applicatif	11	Prive	Périmètre des 11 VM
+VM RP	1	Public	Caddy (reverse proxy) + Postfix (mail)
+VM Bastion	1	Public	Accès SSH des équipes (rebond)
+TOTAL EXPLOITE	13	—	11 privées + 2 publiques
+
+Points structurants : la VM RP porte l'exposition publique (Caddy en frontal + Postfix pour le mail sortant) et le bastion porte l'accès d'administration. Ces deux fonctions sont déjà mutualisées QUALIF/RECETTE et constituent la frontière de sécurité de l'intranet.
+3. Contraintes empêchant la cible « 1 VM unique »
+Faire cohabiter l'ensemble des services (3 fronts/backs Drupal, BDD, Solr, Redis, Varnish, et a fortiori RP + bastion) sur une VM unique se heurte à plusieurs catégories de contraintes, classées par criticité.
+3.1. Contraintes de sécurité (bloquantes en SecNumCloud)
+•	Rôle du bastion et de la VM RP : ce sont les seuls points à IP publique, qui forment la frontière entre Internet et l'intranet prive. Les fusionner avec les services applicatifs reviendrait à exposer directement la BDD et les Drupal sur Internet — incompatible avec SecNumCloud et avec le modèle intranet actuel.
+•	Séparation des fonctions : le référentiel SecNumCloud impose une séparation des rôles et une réduction de la surface d'attaque. Concentrer exposition, admin, BDD, cache et applicatif sur un même OS multiplie les vecteurs : une compromission d'un Drupal donnerait accès a tout, y compris aux données et au mail.
+•	Segmentation réseau / Security groups : le modèle actuel sépare le public (RP, bastion) du prive (applicatif, BDD). Une VM unique annule ces règles : tout transite en loopback, sans filtrage inter-services.
+•	Mises à jour et conformité : la VM unique cumulerait les CVE de toutes les stacks (Apache, PHP, MariaDB, Solr/JVM, Redis, Varnish, Caddy, Postfix), compliquant le maintien en conditions de sécurité exige en SecNumCloud.
+3.2. Contraintes de séparation des environnements
+•	QUALIF et RECETTE doivent rester isoles : la recette valide ce qui partira en production ; elle ne doit pas être perturbée par les tests de qualif. Une VM commune crée un couplage (un crash mémoire en qualif impacte la recette) et compromet la valeur probante de la recette.
+•	Cycles de vie différents : déploiements, redémarrages et purges de cache n'ont ni la même fréquence ni le même calendrier sur les deux environnements.
+3.3. Contraintes de capacite et de performance
+La somme des empreintes mémoire rend une VM unique soit sous-dimensionnée, soit aussi couteuse qu'une mutualisation partielle :
+Service	RAM indicative	Sensibilité
+Solr (JVM)	2–4 Go	JVM dédiée, GC ; concurrence mémoire forte
+Redis	2–4 Go	In-memory, à isoler du reste
+Varnish	1–2 Go	Cache en RAM, dimensionne selon le hit ratio
+MariaDB	2–4 Go	Buffer pool; I/O sensible
+Apache/PHP (×3 projets)	3–6 Go	PHP, pics de trafic, 3 sites cumules
+Cumul (1 env.)	~10–20 Go	+ marge OS/pics → contention mémoire & CPU
+
+•	Contention des ressources : Les composants (Solr, MariaDB, PHP) se disputent la mémoire RAM, ce qui peut saturer le serveur et faire crasher tous les services en même temps.
+•	Risque de panne totale : Un simple pic de trafic ou un manque de mémoire (OOM) bloque l'intégralité du système d'un coup.
+•	Conflits techniques : Accumuler tous les serveurs web (Varnish, Apache, Caddy) sur une seule machine crée une gestion des ports trop complexe et fragile.
+3.4. Contraintes opérationnelles et de disponibilité
+•	Point de défaillance unique (SPOF) : toute opération (reboot, montée de version, incident) mettrait hors service l'intégralité des 3 projets et des 2 environnements.
+•	Maintenance impossible sans interruption globale : patcher la JVM Solr imposerait de toucher la VM qui héberge aussi la BDD, le mail et le front.
+•	Diagnostic & supervision dégrades : la stack InfluxDB/Telegraf/Grafana perd en lisibilité quand tous les services partagent les mêmes métriques hôte.
+4. Proposition de réduction maximale recommandée
+Compte tenu des contraintes, deux leviers réduisent fortement les couts sans sacrifier la sécurité ni la séparation des environnements :
+1.	Mutualiser les 3 applicatifs d'un environnement sur une seule VM (vhosts + pools PHP-FPM séparés).
+2.	Conteneuriser les services techniques (Redis, Solr, Varnish) via Docker pour les cloisonner logiquement sur l'hôte applicatif de leur environnement.
+4.1. Scenario recommande — 5 VM (-62 %)
+VM	Services héberges	Portée
+VM-RP	Caddy (reverse proxy) + Postfix (mail). Reprise du rôle de cache HTTP de Varnish.	Mutualisée (publique)
+VM-BASTION	Accès SSH des équipes (rebond)	Mutualisée (publique)
+VM-APP-QUALIF	3 Drupal (Apache/PHP) + Redis + Solr conteneurises	QUALIF (privée)
+VM-APP-RECETTE	3 Drupal (Apache/PHP) + Redis + Solr conteneurises	RECETTE (privée)
+VM-DB	MariaDB QUALIF + RECETTE (instances/schemas sépares)	Mutualisée (privée)
+
+Synthèse de la réduction par service :
+Service	Avant	Après	Action
+Applicatif (3 projets ×2 env.)	6	2	Mutualisation des 3 projets / env.
+BDD	2	1	Mutualisation, instances séparées
+Redis + Solr	2	0	Conteneurise sur l'applicatif
+Varnish	1	0	Replie sur Caddy (VM-RP)
+RP + Bastion	2	2	Conserves (sécurité)
+TOTAL	13	5	-62 %
+
+Bénéfices :
+•	VM RP et bastions préservés dans leur rôle de frontière publique/privée (exigence SecNumCloud et modèle intranet respectes).
+•	Séparation QUALIF / RECETTE maintenue sur l'applicatif (pas de couplage entre environnements).
+•	BDD maintenue hors des VM applicatives (limite l'impact d'une compromission Drupal sur les données).
+•	Reduction de cout de ~62 % sans SPOF transverse aux environnements.
+4.2. Choix retenus & justification
+•	BDD mutualisée QUALIF+RECETTE sur 1 VM : instances MariaDB distinctes. Le risque de couplage reste faible avec des instances séparées, tout en gardant la donnée isolée de l'applicatif.
+•	Redis + Solr conteneurises sur l'applicatif : ils servent uniquement leur propre environnement, en flux interne prive ; une VM dédiée ne se justifie plus à cette échelle. L'isolation par conteneur (limites mémoire) est suffisante.
+•	Varnish replie sur Caddy : le cache HTTP a peu d'intérêt en QUALIF/RECETTE (faible trafic) ; le rôle est assure par Caddy sur la VM-RP, ce qui supprime une VM sans perte fonctionnelle.
+5. Délai de mise à disposition du nouvel environnement
+La mise à disposition implique de provisionner les VM, mais aussi de revoir les flux réseau, les scripts de déploiement, et de réaliser des tests de bout en bout. Estimation par lot (hypothese : tenant cloud-gouv-eu actif, quotas et images Ubuntu 24 alignes sur west-eu) :
+Lot de travail	Charge	Detail / points d'attention
+Provisioning IaC (Terraform)	3–5 j	Adapter modules/variables a cloud-gouv-eu, nouveaux IDs réseau, security groups public (RP/bastion) vs prive
+Config services (Ansible)	4–6 j	Conteneurisation Redis/Solr/Varnish, vhosts Caddy/Apache mutualises, limites memoire par conteneur
+Flux réseau & firewall	3–5 j	Nouveaux flux a validé : bastion→VM, RP→app, sortants APIM/Banque de France, mail Postfix, DNS, certificats
+Refonte scripts de déploiement	4–7 j	Pipelines CI/CD (Jenkins/K8s) : nouveaux hotes, chemins conteneurs, secrets cloud-gouv
+Migration données & contenus	2–4 j	Dumps BDD (instances separees), index Solr a reconstruire, fichiers
+Tests bout-en-bout & recette	4–6 j	Tests fonctionnels 3 projets, charge, validation integration Banque de France (APIM REC)
+Supervision & sécurité	2–3 j	InfluxDB/Telegraf/Grafana par conteneur, durcissement, conformite SecNumCloud
+TOTAL 	~4 à 6 semaines	≈ 22–36 j-h, soit 1 a 1,5 mois calendaire
+5.1. Nouveaux flux à ouvrir
+•	Flux d'administration : bastion → VM applicatives et BDD (SSH), dans la zone gouv isolée.
+•	Flux de frontal : RP (Caddy) → VM applicatives QUALIF/RECETTE ; flux mail sortant via Postfix.
+•	Flux interservices : Drupal → Redis, Solr (local conteneur), Drupal → MariaDB (VM-DB).
+•	DNS, certificats TLS 1.3 et déclaration des nouveaux endpoints dans la zone cloud-gouv-eu.
+5.2. Scripts de déploiement à revoir
+•	Terraform : élimination des IDs hardcodes, paramétrage par environnement et par région (state distinct cloud-gouv-eu).
+•	Ansible : rôles adaptes à la conteneurisation (Docker) de Redis/Solr/Varnish, avec limites de ressources.
+•	Pipelines CI/CD : reciblage des hôtes (de 11 cibles a 2 hôtes applicatifs), secrets propres a la zone gouv ; la livraison des dépendances (ZIP / composer) reste inchangée mais les hôtes cibles changent.
+6. Conclusion & recommandation
+
+La cible « 1 VM unique pour QUALIF + RECETTE » n'est pas tenable : elle viole le cloisonnement SecNumCloud (RP et bastion, séparation des rôles), supprime la séparation des environnements, et créé un SPOF avec forte contention de ressources.
+Recommandation : retenir le scenario a 5 VM (-62 %) => VM-RP (Caddy + Postfix + cache), VM-Bastion, VM-APP-QUALIF et VM-APP-RECETTE (3 Drupal + Redis + Solr conteneurises chacune), et VM-DB mutualisée (instances séparées).
+Ce scenario est valide sous réserve des 3 prérequis (limites de ressources par conteneur, supervision par conteneur, IaC reproductible). Il maximise l'économie tout en respectant la sécurité et la robustesse.
+
+
+
+
+
+
